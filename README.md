@@ -25,148 +25,146 @@ This library:
 Debug registers are per-thread, so the library enumerates all threads and applies breakpoints to each one.
 
 ## Build
-
+```
     gcc -Wall -O2 -Iinclude -o hwbp_hook.exe src/main.c src/hwbp.c -lpsapi
-
-Or use the Makefile:
-
-    make
+```
 
 ## API
 
 ### Initialization
-
+```
 bool hwbp_init(void)
-
+```
 Initializes the library and registers the exception handler. Called automatically by hwbp_set() if needed.
 
 Returns true on success.
-
+```
 void hwbp_shutdown(void)
-
+```
 Removes all hooks and cleans up. Call before exit.
 
 ### Installing Hooks
-
+```
 int hwbp_set(void *addr, hwbp_fn fn, void *arg)
-
+```
 Installs a hook at addr. When execution reaches that address, fn is called with arg.
 
 Returns slot number (0-3) on success, -1 if all slots are occupied.
 
 Example:
-
+```
     void *target = hwbp_resolve("kernel32.dll", "CreateFileW");
     int slot = hwbp_set(target, my_callback, NULL);
-
+```
 ### Removing Hooks
-
+```
 void hwbp_del(int slot)
-
+```
 Removes the hook in slot slot.
-
+```
 void hwbp_del_addr(void *addr)
-
+```
 Removes the hook at address addr.
-
+```
 void hwbp_clear(void)
-
+```
 Removes all hooks.
 
 ### Runtime Control
-
+```
 void hwbp_on(int slot)
-
+```
 Enables a disabled hook without reinstalling.
-
+```
 void hwbp_off(int slot)
-
+```
 Temporarily disables a hook without removing it. The slot remains occupied.
-
+```
 void hwbp_retarget(int slot, void *addr)
-
+```
 Changes the target address of an existing hook. Useful for redirecting to a different function.
-
+```
 void hwbp_refn(int slot, hwbp_fn fn)
-
+```
 Changes the callback function.
-
+```
 void hwbp_rearg(int slot, void *arg)
-
+```
 Changes the user argument passed to the callback.
 
 ### Queries
-
+```
 int hwbp_slot(void *addr)
-
+```
 Finds the slot number for a given address. Returns -1 if not found.
-
+```
 void *hwbp_addr(int slot)
-
+```
 Returns the address hooked in slot, or NULL if inactive.
-
+```
 bool hwbp_enabled(int slot)
-
+```
 Returns true if the hook is active and enabled.
-
+```
 int hwbp_count(void)
-
+```
 Returns the number of active hooks (0-4).
 
 ### Thread Management
-
+```
 void hwbp_sync(DWORD tid)
-
+```
 Applies all active hooks to thread tid. Call this after creating a new thread.
-
+```
 void hwbp_sync_all(void)
-
+```
 Reapplies all hooks to all threads. Use after making runtime modifications to ensure consistency.
 
 ### Utility
-
+```
 void *hwbp_resolve(const char *mod, const char *fn)
-
+```
 Resolves a function address by module and function name. Loads the module if not already loaded.
 
 Example:
-
+```
     void *addr = hwbp_resolve("user32.dll", "MessageBoxA");
-
+```
 ## Callback Function
 
 Your callback receives full CPU context and must return an action.
-
+```
 typedef hwbp_action_t (*hwbp_fn)(PCONTEXT ctx, void *arg);
-
+```
 ### Context Access
 
 The PCONTEXT ctx parameter gives you access to all registers at the moment the breakpoint triggers.
-
+```
 Arguments (x64 fastcall):
   ctx->Rcx    1st argument
   ctx->Rdx    2nd argument
   ctx->R8     3rd argument
   ctx->R9     4th argument
   Stack arguments start at ctx->Rsp + 0x28
-
+```
+```
 Other useful registers:
   ctx->Rax    return value (on function exit)
   ctx->Rip    instruction pointer
   ctx->Rsp    stack pointer
-
+```
 You can read and modify any of these.
 
 ### Return Values
-
+```
 HWBP_CONTINUE   Execute the original instruction normally
 HWBP_SKIP       Skip the instruction (you must adjust Rip)
 HWBP_REDIRECT   Rip was changed, jump there
-
+```
 ## Examples
 
 ### Basic Hook
-
+```
     hwbp_action_t on_messagebox(PCONTEXT ctx, void *arg)
     {
         const char *text = (const char *)ctx->Rdx;
@@ -185,9 +183,9 @@ HWBP_REDIRECT   Rip was changed, jump there
         
         hwbp_shutdown();
     }
-
+```
 ### Modify Arguments
-
+```
     hwbp_action_t redirect_file(PCONTEXT ctx, void *arg)
     {
         wchar_t *path = (wchar_t *)ctx->Rcx;
@@ -199,9 +197,9 @@ HWBP_REDIRECT   Rip was changed, jump there
         
         return HWBP_CONTINUE;
     }
-
+```
 ### Block Execution
-
+```
     hwbp_action_t block_exit(PCONTEXT ctx, void *arg)
     {
         /* Fake a successful return without calling the function */
@@ -210,9 +208,9 @@ HWBP_REDIRECT   Rip was changed, jump there
         ctx->Rsp += 8;                     /* pop return address */
         return HWBP_SKIP;
     }
-
+```
 ### Runtime Modification
-
+```
     int slot = hwbp_set(func_a, callback_a, NULL);
 
     /* Later: redirect to different function */
@@ -226,9 +224,10 @@ HWBP_REDIRECT   Rip was changed, jump there
 
     /* Re-enable */
     hwbp_on(slot);
+```
 
 ### New Thread Support
-
+```
     DWORD WINAPI worker_thread(LPVOID param)
     {
         /* Apply hooks to this thread */
@@ -237,7 +236,7 @@ HWBP_REDIRECT   Rip was changed, jump there
         /* Now hooks are active here */
         return 0;
     }
-
+```
 ## Limitations
 
 - Maximum 4 hooks (CPU has 4 debug registers)
