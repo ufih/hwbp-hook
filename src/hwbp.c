@@ -1,5 +1,8 @@
 /*
  * hwbp.c - Hardware Breakpoint Hooking Implementation
+ *
+ * Implements the runtime for managing hardware breakpoint hooks on Windows.
+ * Uses DR0–DR3 for addresses, DR6 for status, and DR7 for control.[web:132][web:136]
  */
 
 #include "hwbp.h"
@@ -7,68 +10,100 @@
 #include <string.h>
 
 /*
+ * Architecture detection.
+ * Thanks to https://github.com/EvilBytecode for telling me to add x86 support.
+ *
+ * The debug registers exist on both x86 and x64, but the CONTEXT register
+ * fields and pointer sizes differ.[web:132][web:141]
+ *
+ * We abstract the debug register and control values via hwbp_reg_t.
+ */
+#if defined(_M_X64) || defined(__x86_64__)
+    #define HWBP_ARCH_X64
+    typedef DWORD64 hwbp_reg_t;
+#elif defined(_M_IX86) || defined(__i386__)
+    #define HWBP_ARCH_X86
+    typedef DWORD hwbp_reg_t;
+#else
+    #error "Unsupported architecture: only x86/x64 are supported."
+#endif
+
+/*
  * Internal hook state structure.
+ *
+ * Each hook corresponds to one hardware breakpoint slot (DR0–DR3).
  */
 typedef struct
 {
-    void    *addr;      /* Target address */
-    hwbp_fn  fn;        /* Callback function */
-    void    *arg;       /* User argument */
-    bool     active;    /* Slot is in use */
-    bool     enabled;   /* Hook is active on threads */
+    void    *addr;      /* Target address for breakpoint */
+    hwbp_fn  fn;        /* User callback function */
+    void    *arg;       /* User argument passed to callback */
+    bool     active;    /* Slot in use */
+    bool     enabled;   /* Breakpoint applied to threads */
 
 } hook_t;
 
 /*
- * Global context containing all hooks and VEH state.
+ * Global context containing all hooks and vectored exception handler state.
  */
 static struct
 {
-    hook_t           hooks[4];      /* Four hardware breakpoint slots */
-    PVOID            veh;           /* Vectored exception handler */
-    CRITICAL_SECTION lock;          /* Thread safety */
-    bool             ready;         /* Library initialized */
+    hook_t           hooks[4];  /* Four hardware breakpoint slots */
+    PVOID            veh;       /* Vectored exception handler handle */
+    CRITICAL_SECTION lock;      /* Global lock for thread safety */
+    bool             ready;     /* Initialization flag */
 
-} ctx = {0};
-
+} ctx = { 0 };
 
 /*
  * Enable a breakpoint in DR7.
- * Sets the local enable bit and configures for execute breakpoint (condition=00, length=00).
+ *
+ * DR7 layout (per slot i):[web:136]
+ *   - Bit (i*2):   local enable
+ *   - Bit (i*2+1): global enable (unused here)
+ *   - Bits 16+4*i..19+4*i: type/length (we clear these, leaving 00: execute, 1 byte)
  */
-static DWORD64 dr7_enable(DWORD64 dr7, int slot)
+static hwbp_reg_t
+dr7_enable(hwbp_reg_t dr7, int slot)
 {
-    /* Enable local breakpoint for this slot */
+    /*
+     * Enable local breakpoint for this slot.
+     * For slot i, local enable is bit 2*i.[web:136]
+     */
     dr7 |= (1ULL << (slot * 2));
 
-    /* Clear existing condition and length bits */
+    /*
+     * Clear existing condition and length bits for this slot (4 bits).
+     * Bits 16+4*i..19+4*i are R/W length + condition.[web:136]
+     */
     dr7 &= ~(0x0FULL << (16 + slot * 4));
 
-    /* Condition=00 (execute), length=00 (1 byte) is already zero, so nothing to set */
+    /*
+     * Condition = 00 (execute), length = 00 (1 byte) is left at zero.
+     */
     return dr7;
 }
-
 
 /*
  * Disable a breakpoint in DR7.
- * Clears the enable bit and condition/length fields.
  */
-static DWORD64 dr7_disable(DWORD64 dr7, int slot)
+static hwbp_reg_t
+dr7_disable(hwbp_reg_t dr7, int slot)
 {
-    /* Disable local breakpoint */
+    /* Disable local breakpoint (clear 2*i). */
     dr7 &= ~(1ULL << (slot * 2));
 
-    /* Clear condition and length */
+    /* Clear condition and length for this slot. */
     dr7 &= ~(0x0FULL << (16 + slot * 4));
 
     return dr7;
 }
 
-
 /*
- * Write a value to one of the debug address registers (DR0-DR3).
+ * Write a value to one of the debug address registers (DR0–DR3).
  */
-static void write_dr(PCONTEXT c, int slot, DWORD64 value)
+static void
+write_dr(PCONTEXT c, int slot, hwbp_reg_t value)
 {
     switch (slot)
     {
@@ -76,25 +111,43 @@ static void write_dr(PCONTEXT c, int slot, DWORD64 value)
         case 1: c->Dr1 = value; break;
         case 2: c->Dr2 = value; break;
         case 3: c->Dr3 = value; break;
+        default:
+            break;
     }
 }
 
+/*
+ * Get the current instruction pointer (Eip or Rip) as a void*.
+ */
+static void *
+get_ip(PCONTEXT c)
+{
+#ifdef HWBP_ARCH_X64
+    return (void *)c->Rip;
+#else
+    return (void *)c->Eip;
+#endif
+}
 
 /*
  * Apply or clear a breakpoint on a specific thread.
- * 
+ *
  * Parameters:
- *   tid    - Thread ID
- *   slot   - Debug register slot (0-3)
- *   addr   - Address to set (ignored if enable=false)
- *   enable - true to set breakpoint, false to clear
+ *   tid    - Thread ID.
+ *   slot   - Debug register slot (0–3).
+ *   addr   - Breakpoint address (ignored if enable == false).
+ *   enable - true to set breakpoint, false to clear.
  */
-static void apply_to_thread(DWORD tid, int slot, void *addr, bool enable)
+static void
+apply_to_thread(DWORD tid, int slot, void *addr, bool enable)
 {
-    HANDLE thread;
-    bool need_close = false;
+    HANDLE thread      = NULL;
+    bool   need_close  = false;
 
-    /* Get thread handle */
+    /*
+     * If it's the current thread, use GetCurrentThread().
+     * Otherwise open a handle with sufficient rights to manipulate context.[web:138]
+     */
     if (tid == GetCurrentThreadId())
     {
         thread = GetCurrentThread();
@@ -114,18 +167,20 @@ static void apply_to_thread(DWORD tid, int slot, void *addr, bool enable)
         SuspendThread(thread);
     }
 
-    /* Modify debug registers */
-    CONTEXT c = { .ContextFlags = CONTEXT_DEBUG_REGISTERS };
+    /* Only modify debug registers (CONTEXT_DEBUG_REGISTERS). */
+    CONTEXT c;
+    memset(&c, 0, sizeof(c));
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 
     if (GetThreadContext(thread, &c))
     {
-        write_dr(&c, slot, enable ? (DWORD64)addr : 0);
+        write_dr(&c, slot, enable ? (hwbp_reg_t)addr : 0);
         c.Dr7 = enable ? dr7_enable(c.Dr7, slot) : dr7_disable(c.Dr7, slot);
-        c.Dr6 = 0;  /* Clear status register */
+        c.Dr6 = 0;  /* Clear status register so stale flags don't leak.[web:142] */
+
         SetThreadContext(thread, &c);
     }
 
-    /* Cleanup */
     if (need_close)
     {
         ResumeThread(thread);
@@ -133,19 +188,23 @@ static void apply_to_thread(DWORD tid, int slot, void *addr, bool enable)
     }
 }
 
-
 /*
- * Apply or clear a breakpoint on all threads in the process.
- * Enumerates threads via toolhelp snapshot.
+ * Apply or clear a breakpoint on all threads in the current process.
+ *
+ * Uses a thread snapshot to enumerate threads via ToolHelp32.[web:132][web:139]
  */
-static void apply_to_all_threads(int slot, void *addr, bool enable)
+static void
+apply_to_all_threads(int slot, void *addr, bool enable)
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
 
     if (snapshot == INVALID_HANDLE_VALUE)
         return;
 
-    THREADENTRY32 entry = { .dwSize = sizeof(entry) };
+    THREADENTRY32 entry;
+    memset(&entry, 0, sizeof(entry));
+    entry.dwSize = sizeof(entry);
+
     DWORD pid = GetCurrentProcessId();
 
     if (Thread32First(snapshot, &entry))
@@ -161,15 +220,17 @@ static void apply_to_all_threads(int slot, void *addr, bool enable)
     CloseHandle(snapshot);
 }
 
-
 /*
  * Vectored Exception Handler.
- * Catches EXCEPTION_SINGLE_STEP, identifies which breakpoint triggered,
- * and invokes the corresponding callback.
+ *
+ * Catches EXCEPTION_SINGLE_STEP, checks DR6 to find which breakpoint fired,
+ * verifies the IP matches the expected address, and then calls the user
+ * callback for that hook.[web:132][web:139][web:136]
  */
-static LONG CALLBACK exception_handler(PEXCEPTION_POINTERS info)
+static LONG CALLBACK
+exception_handler(PEXCEPTION_POINTERS info)
 {
-    /* Only handle single-step exceptions */
+    /* Only process single-step exceptions triggered by debug registers. */
     if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP)
         return EXCEPTION_CONTINUE_SEARCH;
 
@@ -177,27 +238,30 @@ static LONG CALLBACK exception_handler(PEXCEPTION_POINTERS info)
 
     EnterCriticalSection(&ctx.lock);
 
-    /* Check each debug register */
+    /*
+     * DR6 bits B0..B3 indicate which debug event fired.[web:136]
+     * We iterate all four possible slots and handle only the ones we own.
+     */
     for (int i = 0; i < 4; i++)
     {
-        /* Check if this breakpoint triggered (DR6 status bit) */
+        /* Check if this breakpoint triggered (DR6 bit i set). */
         if (!(c->Dr6 & (1 << i)))
             continue;
 
         hook_t *hook = &ctx.hooks[i];
 
-        /* Verify hook is active and enabled */
+        /* Skip inactive or disabled hooks. */
         if (!hook->active || !hook->enabled)
             continue;
 
-        /* Verify RIP matches the hook address */
-        if (hook->addr != (void *)c->Rip)
+        /* Ensure the current instruction pointer is exactly the hook address. */
+        if (hook->addr != get_ip(c))
             continue;
 
-        /* Clear the status bit */
+        /* Clear the status bit B[i] in DR6 to avoid stale flags. */
         c->Dr6 &= ~(1ULL << i);
 
-        /* Invoke user callback */
+        /* Call user callback outside of any further iteration logic. */
         hwbp_action_t action = HWBP_CONTINUE;
 
         if (hook->fn)
@@ -206,8 +270,12 @@ static LONG CALLBACK exception_handler(PEXCEPTION_POINTERS info)
         LeaveCriticalSection(&ctx.lock);
 
         /*
-         * Set Resume Flag (RF) in EFLAGS to skip the breakpoint for one instruction.
-         * This prevents infinite loop when continuing execution.
+         * For HWBP_CONTINUE:
+         *   Set Resume Flag (RF, bit 16 of EFLAGS) to disable further
+         *   single-step exceptions on the very next instruction.[web:136][web:139]
+         *
+         * For HWBP_SKIP / HWBP_REDIRECT:
+         *   Caller manipulates Eip/Rip; we just continue execution.
          */
         if (action == HWBP_CONTINUE)
             c->EFlags |= 0x10000;
@@ -219,8 +287,11 @@ static LONG CALLBACK exception_handler(PEXCEPTION_POINTERS info)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-
-bool hwbp_init(void)
+/*
+ * Initialize global context and register the vectored exception handler.
+ */
+bool
+hwbp_init(void)
 {
     if (ctx.ready)
         return true;
@@ -228,7 +299,10 @@ bool hwbp_init(void)
     memset(&ctx, 0, sizeof(ctx));
     InitializeCriticalSection(&ctx.lock);
 
-    /* Register our exception handler (first in chain) */
+    /*
+     * Register the vectored exception handler with priority 1.
+     * This gives it a chance to run before most user handlers.[web:132]
+     */
     ctx.veh = AddVectoredExceptionHandler(1, exception_handler);
 
     if (!ctx.veh)
@@ -241,16 +315,19 @@ bool hwbp_init(void)
     return true;
 }
 
-
-void hwbp_shutdown(void)
+/*
+ * Shutdown the library: remove hooks and unregister the handler.
+ */
+void
+hwbp_shutdown(void)
 {
     if (!ctx.ready)
         return;
 
-    /* Remove all hooks */
+    /* Remove all hooks and clear debug registers. */
     hwbp_clear();
 
-    /* Unregister exception handler */
+    /* Unregister vectored exception handler. */
     if (ctx.veh)
         RemoveVectoredExceptionHandler(ctx.veh);
 
@@ -258,15 +335,18 @@ void hwbp_shutdown(void)
     ctx.ready = false;
 }
 
-
-int hwbp_set(void *addr, hwbp_fn fn, void *arg)
+/*
+ * Install a hardware breakpoint hook in the first free slot.
+ */
+int
+hwbp_set(void *addr, hwbp_fn fn, void *arg)
 {
     if (!ctx.ready && !hwbp_init())
         return -1;
 
     EnterCriticalSection(&ctx.lock);
 
-    /* Find a free slot */
+    /* Find a free slot. */
     int slot = -1;
 
     for (int i = 0; i < 4; i++)
@@ -289,15 +369,18 @@ int hwbp_set(void *addr, hwbp_fn fn, void *arg)
 
     LeaveCriticalSection(&ctx.lock);
 
-    /* Apply to all threads */
+    /* Apply to all threads if a slot was obtained. */
     if (slot >= 0)
         apply_to_all_threads(slot, addr, true);
 
     return slot;
 }
 
-
-void hwbp_del(int slot)
+/*
+ * Remove a hook by slot index.
+ */
+void
+hwbp_del(int slot)
 {
     if (slot < 0 || slot > 3 || !ctx.ready)
         return;
@@ -315,12 +398,15 @@ void hwbp_del(int slot)
 
     LeaveCriticalSection(&ctx.lock);
 
-    /* Clear from all threads */
+    /* Clear from all threads. */
     apply_to_all_threads(slot, NULL, false);
 }
 
-
-void hwbp_del_addr(void *addr)
+/*
+ * Remove a hook by address.
+ */
+void
+hwbp_del_addr(void *addr)
 {
     int slot = hwbp_slot(addr);
 
@@ -328,15 +414,21 @@ void hwbp_del_addr(void *addr)
         hwbp_del(slot);
 }
 
-
-void hwbp_clear(void)
+/*
+ * Remove all hooks.
+ */
+void
+hwbp_clear(void)
 {
     for (int i = 0; i < 4; i++)
         hwbp_del(i);
 }
 
-
-void hwbp_on(int slot)
+/*
+ * Enable a previously disabled hook.
+ */
+void
+hwbp_on(int slot)
 {
     if (slot < 0 || slot > 3)
         return;
@@ -359,8 +451,11 @@ void hwbp_on(int slot)
     apply_to_all_threads(slot, addr, true);
 }
 
-
-void hwbp_off(int slot)
+/*
+ * Disable a hook without removing it.
+ */
+void
+hwbp_off(int slot)
 {
     if (slot < 0 || slot > 3)
         return;
@@ -382,8 +477,11 @@ void hwbp_off(int slot)
     apply_to_all_threads(slot, NULL, false);
 }
 
-
-void hwbp_retarget(int slot, void *addr)
+/*
+ * Change the target address of an existing hook.
+ */
+void
+hwbp_retarget(int slot, void *addr)
 {
     if (slot < 0 || slot > 3)
         return;
@@ -403,13 +501,16 @@ void hwbp_retarget(int slot, void *addr)
 
     LeaveCriticalSection(&ctx.lock);
 
-    /* Reapply if currently enabled */
+    /* Reapply if currently enabled. */
     if (enabled)
         apply_to_all_threads(slot, addr, true);
 }
 
-
-void hwbp_refn(int slot, hwbp_fn fn)
+/*
+ * Change the callback function of an existing hook.
+ */
+void
+hwbp_refn(int slot, hwbp_fn fn)
 {
     if (slot < 0 || slot > 3)
         return;
@@ -422,8 +523,11 @@ void hwbp_refn(int slot, hwbp_fn fn)
     LeaveCriticalSection(&ctx.lock);
 }
 
-
-void hwbp_rearg(int slot, void *arg)
+/*
+ * Change the user argument of an existing hook.
+ */
+void
+hwbp_rearg(int slot, void *arg)
 {
     if (slot < 0 || slot > 3)
         return;
@@ -436,8 +540,11 @@ void hwbp_rearg(int slot, void *arg)
     LeaveCriticalSection(&ctx.lock);
 }
 
-
-int hwbp_slot(void *addr)
+/*
+ * Find the slot index for a given address.
+ */
+int
+hwbp_slot(void *addr)
 {
     EnterCriticalSection(&ctx.lock);
 
@@ -454,8 +561,11 @@ int hwbp_slot(void *addr)
     return -1;
 }
 
-
-void *hwbp_addr(int slot)
+/*
+ * Get the target address for a slot.
+ */
+void *
+hwbp_addr(int slot)
 {
     if (slot < 0 || slot > 3)
         return NULL;
@@ -463,8 +573,11 @@ void *hwbp_addr(int slot)
     return ctx.hooks[slot].active ? ctx.hooks[slot].addr : NULL;
 }
 
-
-bool hwbp_enabled(int slot)
+/*
+ * Check if a slot is active and enabled.
+ */
+bool
+hwbp_enabled(int slot)
 {
     if (slot < 0 || slot > 3)
         return false;
@@ -472,8 +585,11 @@ bool hwbp_enabled(int slot)
     return ctx.hooks[slot].active && ctx.hooks[slot].enabled;
 }
 
-
-int hwbp_count(void)
+/*
+ * Get the number of active hooks.
+ */
+int
+hwbp_count(void)
 {
     int count = 0;
 
@@ -486,8 +602,11 @@ int hwbp_count(void)
     return count;
 }
 
-
-void hwbp_sync(DWORD tid)
+/*
+ * Apply all active hooks to a specific thread.
+ */
+void
+hwbp_sync(DWORD tid)
 {
     EnterCriticalSection(&ctx.lock);
 
@@ -502,8 +621,11 @@ void hwbp_sync(DWORD tid)
     LeaveCriticalSection(&ctx.lock);
 }
 
-
-void hwbp_sync_all(void)
+/*
+ * Reapply all active hooks to all threads.
+ */
+void
+hwbp_sync_all(void)
 {
     EnterCriticalSection(&ctx.lock);
 
@@ -518,8 +640,11 @@ void hwbp_sync_all(void)
     LeaveCriticalSection(&ctx.lock);
 }
 
-
-void *hwbp_resolve(const char *mod, const char *fn)
+/*
+ * Resolve a function address by module and function name.
+ */
+void *
+hwbp_resolve(const char *mod, const char *fn)
 {
     HMODULE handle = GetModuleHandleA(mod);
 
