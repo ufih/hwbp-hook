@@ -1,7 +1,5 @@
 # hwbp-hook
 
-Hardware breakpoint hooking library for x64 Windows.
-
 Uses CPU debug registers (DR0-DR3) to intercept function execution without modifying memory.
 
 ## Features
