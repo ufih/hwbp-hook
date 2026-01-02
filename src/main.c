@@ -1,128 +1,93 @@
 /*
- * main.c - Entry Point
- *
- * Template for using the hardware breakpoint hooking library.
- * Define your callback functions and install hooks in main().
+ * main.c - hwbp usage template
  */
 
 #include <stdio.h>
 #include "hwbp.h"
 
 /*
- * Hook callback function.
- * Called when the breakpoint triggers.
+ * Hook callback.
  *
- * Parameters:
- *   ctx - CPU context with full register access.
- *   arg - User-provided argument from hwbp_set().
+ * x64 calling convention:
+ *   RCX, RDX, R8, R9 = args 1-4
+ *   Stack at RSP+0x28 = arg 5+
+ *   RAX = return value
  *
- * Windows x64 calling convention (Microsoft):
- *   - 1st argument: RCX  (ctx->Rcx)
- *   - 2nd argument: RDX  (ctx->Rdx)
- *   - 3rd argument: R8   (ctx->R8)
- *   - 4th argument: R9   (ctx->R9)
- *   - Further arguments are on the stack at ctx->Rsp + 0x28, ...
- *   - Return value is in Rax (ctx->Rax).[web:127][web:141]
- *
- * Windows x86 calling convention (cdecl/stdcall):
- *   - Return address at *(DWORD *)ctx->Esp
- *   - 1st argument at *(DWORD *)(ctx->Esp + 0x04)
- *   - 2nd argument at *(DWORD *)(ctx->Esp + 0x08)
- *   - 3rd argument at *(DWORD *)(ctx->Esp + 0x0C)
- *   - Return value is in Eax (ctx->Eax).[web:129][web:134]
- *
- * Return values:
- *   HWBP_CONTINUE - Execute the original instruction normally.
- *   HWBP_SKIP     - Skip the current instruction (you must adjust Eip/Rip).
- *   HWBP_REDIRECT - Eip/Rip was modified, execution will continue from there.
+ * x86 calling convention (cdecl/stdcall):
+ *   Stack at ESP+0x04 = arg 1
+ *   Stack at ESP+0x08 = arg 2
+ *   EAX = return value
  */
-static hwbp_action_t
-hook(PCONTEXT ctx, void *arg)
+static hwbp_action_t hook_callback(PCONTEXT ctx, void *arg)
 {
-    (void)ctx;
     (void)arg;
 
-    /*
-     * Examples (x64):
-     *   - Inspect arguments:
-     *       void *arg1 = (void *)ctx->Rcx;
-     *       void *arg2 = (void *)ctx->Rdx;
-     *
-     *   - Modify arguments:
-     *       ctx->Rcx = (DWORD64)new_value;
-     *
-     *   - Redirect execution:
-     *       ctx->Rip = (DWORD64)other_function;
-     *       return HWBP_REDIRECT;
-     *
-     *   - Block call and fake return:
-     *       ctx->Rax = fake_return_value;
-     *       ctx->Rip = *(DWORD64 *)ctx->Rsp;  // pop return address
-     *       ctx->Rsp += 8;
-     *       return HWBP_SKIP;
-     *
-     * Examples (x86):
-     *   - Inspect first stack argument:
-     *       DWORD arg1 = *(DWORD *)(ctx->Esp + 0x04);
-     *
-     *   - Fake return:
-     *       ctx->Eax = fake_return_value;
-     *       ctx->Eip = *(DWORD *)ctx->Esp;    // pop return address
-     *       ctx->Esp += 4;
-     *       return HWBP_SKIP;
-     */
+#if defined(_M_X64) || defined(__x86_64__)
+    const char *text = (const char *)ctx->Rdx;
+    const char *caption = (const char *)ctx->R8;
+    printf("[HOOK] MessageBoxA called: \"%s\" - \"%s\"\n", caption, text);
+#else
+    const char *text = *(const char **)(ctx->Esp + 0x08);
+    const char *caption = *(const char **)(ctx->Esp + 0x0C);
+    printf("[HOOK] MessageBoxA called: \"%s\" - \"%s\"\n", caption, text);
+#endif
 
     return HWBP_CONTINUE;
 }
 
-int
-main(int argc, char **argv)
+/* Data breakpoint callback - triggered on memory write. */
+static hwbp_action_t write_callback(PCONTEXT ctx, void *arg)
+{
+    (void)ctx;
+    int *watched = (int *)arg;
+    printf("[WATCH] Variable modified! New value: %d\n", *watched);
+    return HWBP_CONTINUE;
+}
+
+static int g_watched_var = 0;
+
+int main(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
 
-    /* Initialize the library (optional, hwbp_set() will auto-init). */
-    hwbp_init();
+    /* Basic execute hook on MessageBoxA */
+    void *target = hwbp_resolve("user32.dll", "MessageBoxA");
+    int slot = hwbp_set(target, hook_callback, NULL);
 
-    /*
-     * Example usage:
-     *
-     * Install a hook:
-     *
-     *     void *target = hwbp_resolve("user32.dll", "MessageBoxA");
-     *     int slot      = hwbp_set(target, hook, NULL);
-     *
-     * Temporarily disable/enable:
-     *
-     *     hwbp_off(slot);
-     *     hwbp_on(slot);
-     *
-     * Modify at runtime:
-     *
-     *     hwbp_retarget(slot, new_address);
-     *     hwbp_refn(slot, new_callback);
-     *     hwbp_rearg(slot, new_argument);
-     *
-     * Remove hooks:
-     *
-     *     hwbp_del(slot);
-     *     hwbp_del_addr(target);
-     *     hwbp_clear();
-     *
-     * Query state:
-     *
-     *     int  s       = hwbp_slot(target);
-     *     void *addr   = hwbp_addr(s);
-     *     bool enabled = hwbp_enabled(s);
-     *     int  count   = hwbp_count();
-     *
-     * Thread synchronization (for new threads):
-     *
-     *     hwbp_sync(thread_id);   // Apply to specific thread
-     *     hwbp_sync_all();        // Reapply to all threads
-     */
+    if (slot < 0) {
+        printf("Failed to set hook\n");
+        return 1;
+    }
 
-    /* Cleanup before exit. */
+    printf("Hook installed in slot %d\n", slot);
+
+    /* Data breakpoint - watch global variable for writes */
+    int data_slot = hwbp_set_ex(&g_watched_var, HWBP_WRITE, HWBP_LEN_4,
+                                write_callback, &g_watched_var);
+
+    if (data_slot >= 0) {
+        printf("Watching variable at %p\n", (void *)&g_watched_var);
+    }
+
+    /* Test execute hook */
+    printf("\nCalling MessageBoxA...\n");
+    MessageBoxA(NULL, "Hello from hooked function!", "Hook Test", MB_OK);
+
+    /* Test data breakpoint */
+    printf("\nModifying watched variable...\n");
+    g_watched_var = 42;
+
+    printf("\nModifying again...\n");
+    g_watched_var = 100;
+
+    /* Stats */
+    printf("\nStatistics:\n");
+    printf("  Execute hook hits: %llu\n", (unsigned long long)hwbp_hits(slot));
+    printf("  Data hook hits: %llu\n", (unsigned long long)hwbp_hits(data_slot));
+    printf("  Total hits: %llu\n", (unsigned long long)hwbp_total_hits());
+
+    /* Cleanup */
     hwbp_shutdown();
 
     return 0;
